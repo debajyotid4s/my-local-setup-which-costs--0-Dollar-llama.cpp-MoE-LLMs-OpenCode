@@ -86,7 +86,7 @@ MIN_P="${LLM_MIN_P:-0.0}"
 COMPACTION_AT="${LLM_COMPACTION_AT:-196608}"
 MMPROJ="${LLM_MMPROJ:-}"
 USE_MTP="${LLM_USE_MTP:-0}"
-THINKING="${LLM_THINKING:-0}"
+THINKING="${LLM_THINKING:-1}"
 LOG_FILE="${LLM_LOG_FILE-$HOME/llm-server.log}"
 
 fail() { echo "ERROR: $*" >&2; exit 1; }
@@ -214,14 +214,6 @@ fi
 
 # ── Optional options ──────────────────────────────────────────────────────────
 EXTRA=()
-
-# This exact model template checks the boolean variable `enable_thinking`.
-# --reasoning is the primary switch; the template kwarg reinforces it.
-if has_option --chat-template-kwargs; then
-  EXTRA+=(--chat-template-kwargs "{\"enable_thinking\":${THINK_KW}}")
-else
-  warn "--chat-template-kwargs is unavailable; --reasoning $REASONING_MODE remains in effect."
-fi
 
 # Cache CPU-resident experts in VRAM for decode-time reuse. Set 0 to disable.
 if has_option --moe-cache-mib; then
