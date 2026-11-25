@@ -4,6 +4,8 @@ Zero-API-cost coding agent: a local LLM served by `llama-server`, driven by **Op
 (V2 config and plugin API). Two launchers are included: `qwen3.6-35b-a3b` and
 `ornith-1.5-35b-a3b`. Target hardware: one NVIDIA GPU (developed on a 16 GB Tesla V100).
 
+## #Disclaimer: The Qwen 3.6-35B-a3b related launching scripts are dropped from this repo, as i am totally shifted to Ornith, it is hard to maintain two LLMs regularly on my poor machine. So as far as I used, the information are given here, if you want to use it, please research the latest HuggingFace card of the model, and change the configurations as needed.
+
 ## Layout
 
 ```
@@ -77,9 +79,10 @@ All knobs are environment variables on `llm-up.sh`.
 | `LLM_UBATCH` / `LLM_BATCH` | 128–512 | Micro-batch; costs VRAM, helps long prefill |
 | `LLM_THREADS` | physical cores | Decode threads |
 | `LLM_KV_K` / `LLM_KV_V` | `q8_0` / `q8_0` | KV cache quant; `q4_0` V saves VRAM |
-| `LLM_COMPACTION_AT` | `196608` | Client threshold hint (75% of 256K) |
+| `LLM_COMPACTION_AT` | `75% of LLM_CTX` | Client threshold hint; auto-tracks `LLM_CTX` overrides |
 | `LLM_MOE_CACHE_MIB` | `1024` | Ornith only: drop to 512/0 on CUDA OOM |
-| `LLM_TEMP` / `LLM_TOP_P` / `LLM_TOP_K` | `0.6` / `0.95` / `20` | Sampling |
+| `LLM_THINKING` | `1` | `1` = thinking/default, `0` = non-thinking; determines per-mode sampling defaults |
+| `LLM_TEMP` / `LLM_TOP_P` / `LLM_TOP_K` / `LLM_MIN_P` | mode-dependent (see below) | Sampling; any can be overridden individually |
 | `LLM_MODEL` / `LLM_SERVER` / `LLM_PORT` | — | Override GGUF, binary, port |
 
 Qwen launcher only (16 GB RAM machines should keep these off): `LLM_MAX_MEM` (cgroup cap),
@@ -87,6 +90,61 @@ Qwen launcher only (16 GB RAM machines should keep these off): `LLM_MAX_MEM` (cg
 Mixed K/V types need `-DGGML_CUDA_FA_ALL_QUANTS=ON`.
 
 Never set OpenCode's model `limit.context` above the server's `LLM_CTX`.
+
+## Ornith launcher changes
+
+The Ornith launcher (`ornith-1.5-35b-a3b/llm-up.sh`) was revised with three substantive
+changes. The Qwen launcher is unaffected.
+
+### Sampling defaults are now mode-dependent
+
+Previously the launcher used a single set of sampling parameters regardless of `LLM_THINKING`.
+The Qwen3 model card prescribes different values per mode:
+
+| Mode | `LLM_TEMP` | `LLM_TOP_P` | `LLM_TOP_K` | `LLM_MIN_P` |
+|---|---|---|---|---|
+| Thinking (`LLM_THINKING=1`, default) | `0.6` | `0.95` | `20` | `0.0` |
+| Non-thinking (`LLM_THINKING=0`) | `0.7` | `0.8` | `20` | `0.0` |
+
+The original launcher applied the thinking-mode values in both cases; with `LLM_THINKING=0` the
+server was running non-thinking mode under a tighter temperature but a wider `top_p` than
+intended. Any of the four variables can still be overridden individually via their `LLM_*`
+equivalents regardless of mode.
+
+**Tradeoff:** Non-thinking mode's `top_p=0.8` is tighter than the former `0.95`. It narrows
+the candidate distribution at each step, which reduces variety slightly but also cuts more
+low-probability tokens. If you want broader sampling in non-thinking mode (e.g., for creative
+tasks), set `LLM_TOP_P=0.95` explicitly. For agentic coding sessions, the tighter default is
+the more conservative choice.
+
+### `--no-context-shift` is now a hard requirement
+
+Previously, if the llama-server binary lacked this flag, the launcher emitted a warning and
+continued. It now calls `fail()` and exits before launch.
+
+**Why:** The deferred-compaction plugin counts on the server returning an error when the context
+fills rather than silently truncating old tokens. With context-shift enabled, the server
+discards early conversation history without surfacing any signal to the client — the agent
+continues generating from a corrupted view of the session. That is not a soft performance
+degradation; it is a silent correctness failure that is difficult to diagnose after the fact.
+
+**Tradeoff:** None in practice. `--no-context-shift` has been in llama.cpp since well before
+commit 77e2db8, which is already stated as the build minimum for Ornith's SM70 FA kernels. Any
+compliant build already has the flag.
+
+### `COMPACTION_AT` now auto-tracks `LLM_CTX`
+
+The default was previously hardcoded to `196608`. It is now computed as `LLM_CTX × 0.75` at
+launch time.
+
+When `LLM_CTX=262144` (the unchanged default) the result is exactly `196608` — identical to
+before. When `LLM_CTX` is overridden, the old hardcoded value could exceed the entire context
+window (e.g., `LLM_CTX=65536` → old default `196608 > 65536`), making the launch summary show
+a threshold that would never fire. The derived default is always consistent with the active
+window and with what the deferred-compaction plugin computes internally (0.75 of `LLM_CTX`).
+
+**Tradeoff:** None. `LLM_COMPACTION_AT` can still be set explicitly to any value below
+`LLM_CTX` to override.
 
 ## Compaction
 
@@ -144,14 +202,15 @@ docker build --build-arg CMAKE_CUDA_ARCHITECTURES=70 -t local-llm-opencode:lates
 docker run -d --name llm-server --gpus all -p 127.0.0.1:8080:8080 \
   -v ~/models/qwen3.6:/models/qwen3.6:ro local-llm-opencode:latest
 
-# Ornith-1.5-35B-A3B (same flags as its launcher)
+# Ornith-1.5-35B-A3B, non-thinking mode (temp/top_p per Qwen3 model card for --reasoning off)
 docker run -d --name llm-server --gpus all -p 127.0.0.1:8080:8080 \
   -v ~/models/ornith1.5:/models/ornith1.5:ro local-llm-opencode:latest \
   -m /models/ornith1.5/Ornith-1.5-35B-A3B-IQ4_XS.gguf \
   --alias ornith-1.5-35b-a3b-iq4-xs -ngl auto --n-cpu-moe 18 --fit off \
   -c 262144 -np 1 -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 512 --jinja \
   --reasoning off --chat-template-kwargs '{"enable_thinking":false}' \
-  --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.0 --host 127.0.0.1 --port 8080
+  --no-context-shift \
+  --temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0 --host 127.0.0.1 --port 8080
 
 docker stop llm-server     # graceful; docker kill to force
 ```
