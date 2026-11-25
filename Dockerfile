@@ -12,7 +12,12 @@
 #     -v ~/models/qwen3.6:/models/qwen3.6:ro \
 #     local-llm-opencode:latest
 #
-# Ornith-1.5-35B-A3B (IQ4_XS, 256K, same flags as scripts/ornith-1.5-35b-a3b/llm-up.sh):
+# Ornith-1.5-35B-A3B (IQ4_XS, 256K, non-thinking mode, matches llm-up.sh with LLM_THINKING=0):
+#   --no-context-shift: required; deferred-compaction depends on the server erroring at the
+#     context limit rather than silently truncating history.
+#   --temp 0.7 --top-p 0.8: Qwen3 model card recommendation for non-thinking mode
+#     (--reasoning off). Thinking mode would use 0.6/0.95 instead.
+#
 #   docker run -d --name llm-server --gpus all -p 127.0.0.1:8080:8080 \
 #     -v ~/models/ornith1.5:/models/ornith1.5:ro \
 #     local-llm-opencode:latest \
@@ -20,7 +25,8 @@
 #     --alias ornith-1.5-35b-a3b-iq4-xs -ngl auto --n-cpu-moe 18 --fit off \
 #     -c 262144 -np 1 -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 512 --jinja \
 #     --reasoning off --chat-template-kwargs '{"enable_thinking":false}' \
-#     --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.0 \
+#     --no-context-shift \
+#     --temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0 \
 #     --host 127.0.0.1 --port 8080
 #
 # The model is mounted from the host so the image stays small.
@@ -89,4 +95,8 @@ ENTRYPOINT ["/usr/local/bin/llama-server"]
 # Warm-start flags: --timeout 0 disables idle KV cache eviction.
 # For prompt-cache persistence, mount /llama-cache and add:
 #   --prompt-cache /llama-cache/qwen3.6-35b-a3b-kvcache.bin --prompt-cache-all
-CMD ["-m", "/models/qwen3.6/Qwen3.6-35B-A3B-UD-IQ4_XS.gguf", "--alias", "qwen3.6-35b-a3b", "-ngl", "99", "--n-cpu-moe", "18", "-fit", "off", "-c", "262144", "-np", "1", "-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "-b", "2048", "-ub", "512", "--jinja", "--chat-template-kwargs", "{\"preserve_thinking\": true}", "--timeout", "0", "--temp", "0.6", "--top-p", "0.95", "--top-k", "20", "--min-p", "0.0", "--presence-penalty", "0.5", "--reasoning-budget", "4096", "--reasoning-budget-message", "Reasoning budget reached. Stop analysing; run one concrete command or test for your leading hypothesis, then continue.", "--host", "127.0.0.1", "--port", "8080"]
+# --no-context-shift: required for deferred-compaction (server must error at the
+#   context limit, not silently truncate). Applies to both models equally.
+# Sampling (0.6/0.95/20/0.0): Qwen3 model card recommendation for thinking mode;
+#   --reasoning-budget implies thinking is active.
+CMD ["-m", "/models/qwen3.6/Qwen3.6-35B-A3B-UD-IQ4_XS.gguf", "--alias", "qwen3.6-35b-a3b", "-ngl", "99", "--n-cpu-moe", "18", "-fit", "off", "-c", "262144", "-np", "1", "-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "-b", "2048", "-ub", "512", "--jinja", "--chat-template-kwargs", "{\"preserve_thinking\": true}", "--timeout", "0", "--no-context-shift", "--temp", "0.6", "--top-p", "0.95", "--top-k", "20", "--min-p", "0.0", "--presence-penalty", "0.5", "--reasoning-budget", "4096", "--reasoning-budget-message", "Reasoning budget reached. Stop analysing; run one concrete command or test for your leading hypothesis, then continue.", "--host", "127.0.0.1", "--port", "8080"]
