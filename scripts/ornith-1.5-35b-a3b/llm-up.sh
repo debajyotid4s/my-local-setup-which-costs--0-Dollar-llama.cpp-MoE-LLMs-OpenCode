@@ -42,20 +42,30 @@
 #   LLM_MOE_CACHE_MIB=0 ./llm-up.sh
 #   LLM_USE_MTP=1 ./llm-up.sh     # optional; consumes extra runtime/VRAM
 #   LLM_MMPROJ=/path/to/mmproj-Ornith-1.5-35B-A3B-f16.gguf ./llm-up.sh
+#   LLM_THINKING=0 ./llm-up.sh    # non-thinking mode; shifts sampling defaults
 #
 # Environment overrides:
 #   LLM_MODEL, LLM_SERVER, LLM_HOST, LLM_PORT
-#   LLM_CTX=131072, LLM_NCMOE=18, LLM_N_GPU_LAYERS=auto
-#   LLM_FIT_TARGET=1024 (MiB per GPU), LLM_MOE_CACHE_MIB=1024
-#   LLM_CACHE_RAM=1536 (MiB), LLM_BATCH=512, LLM_UBATCH=128
+#   LLM_CTX=262144, LLM_NCMOE=18, LLM_N_GPU_LAYERS=auto
+#   LLM_FIT_TARGET=1536 (MiB per GPU), LLM_MOE_CACHE_MIB=1024
+#   LLM_CACHE_RAM=1536 (MiB), LLM_BATCH=2048, LLM_UBATCH=512
 #   LLM_KV_K=q8_0, LLM_KV_V=q8_0
 #   LLM_THREADS, LLM_THREADS_BATCH
-#   LLM_TEMP=0.6, LLM_TOP_P=0.95, LLM_TOP_K=20, LLM_MIN_P=0.0
-#   LLM_COMPACTION_AT=196608 (client threshold; deferred-compaction targets 75% of LLM_CTX)
+#   LLM_THINKING=1 (1=thinking/default, 0=non-thinking)
+#   Sampling defaults are mode-dependent (Qwen3 model card recommendations):
+#     Thinking mode (LLM_THINKING=1): temp=0.6, top_p=0.95, top_k=20, min_p=0.0
+#     Non-thinking  (LLM_THINKING=0): temp=0.7, top_p=0.8,  top_k=20, min_p=0.0
+#   Override individually with LLM_TEMP, LLM_TOP_P, LLM_TOP_K, LLM_MIN_P.
+#   LLM_COMPACTION_AT defaults to 75% of LLM_CTX; override only when tuning.
 #   LLM_MMPROJ= optional image projector; LLM_USE_MTP=0/1
-#   LLM_LOG_FILE (empty disables tee logging)
+#   LLM_LOG_FILE (empty string disables tee logging)
 
 set -Eeuo pipefail
+
+# Helpers defined before any variable setup so the THINKING early-validation
+# below can call fail() without a forward-reference problem.
+fail() { echo "ERROR: $*" >&2; exit 1; }
+warn() { echo "WARN:  $*" >&2; }
 
 MODEL="${LLM_MODEL:-/home/themachinist/models/ornith1.5/Ornith-1.5-35B-A3B-IQ4_XS.gguf}"
 SERVER="${LLM_SERVER:-$HOME/llama.cpp/build/bin/llama-server}"
@@ -79,18 +89,37 @@ KV_V="${LLM_KV_V:-q8_0}"
 THREADS="${LLM_THREADS:-}"
 THREADS_BATCH="${LLM_THREADS_BATCH:-}"
 
-TEMP="${LLM_TEMP:-0.6}"
-TOP_P="${LLM_TOP_P:-0.95}"
-TOP_K="${LLM_TOP_K:-20}"
-MIN_P="${LLM_MIN_P:-0.0}"
-COMPACTION_AT="${LLM_COMPACTION_AT:-196608}"
+# LLM_THINKING must be resolved before the sampling variables because the
+# recommended defaults differ per mode (source: Qwen3 model card).
+# Validation is done here rather than in the main block so the defaults
+# derived from it are correct before anything else reads them.
+THINKING="${LLM_THINKING:-1}"
+[[ "$THINKING" == "0" || "$THINKING" == "1" ]] || fail "LLM_THINKING must be 0 or 1."
+if [[ "$THINKING" == "1" ]]; then
+  REASONING_MODE=on
+  # Qwen3 model card, thinking mode: temp=0.6, top_p=0.95, top_k=20, min_p=0
+  TEMP="${LLM_TEMP:-0.6}"
+  TOP_P="${LLM_TOP_P:-0.95}"
+  TOP_K="${LLM_TOP_K:-20}"
+  MIN_P="${LLM_MIN_P:-0.0}"
+else
+  REASONING_MODE=off
+  # Qwen3 model card, non-thinking mode: temp=0.7, top_p=0.8, top_k=20, min_p=0
+  TEMP="${LLM_TEMP:-0.7}"
+  TOP_P="${LLM_TOP_P:-0.8}"
+  TOP_K="${LLM_TOP_K:-20}"
+  MIN_P="${LLM_MIN_P:-0.0}"
+fi
+
+# Default compaction threshold tracks 75% of the active context window.
+# When CTX is overridden (e.g. LLM_CTX=65536 → 49152), the informational
+# value shown in the launch summary stays consistent with what the
+# deferred-compaction plugin will actually compute (THRESHOLD=0.75 of CTX).
+COMPACTION_AT="${LLM_COMPACTION_AT:-$(( CTX * 3 / 4 ))}"
+
 MMPROJ="${LLM_MMPROJ:-}"
 USE_MTP="${LLM_USE_MTP:-0}"
-THINKING="${LLM_THINKING:-1}"
 LOG_FILE="${LLM_LOG_FILE-$HOME/llm-server.log}"
-
-fail() { echo "ERROR: $*" >&2; exit 1; }
-warn() { echo "WARN: $*" >&2; }
 
 # ── Basic validation ─────────────────────────────────────────────────────────
 [[ -x "$SERVER" ]] || fail "llama-server not executable: $SERVER
@@ -119,8 +148,21 @@ done
 if [[ -n "$CTX_CHECKPOINTS" ]] && (( CTX_CHECKPOINTS * 64 + CACHE_RAM > 4096 )); then
   warn "LLM_CTX_CHECKPOINTS=$CTX_CHECKPOINTS needs roughly $(( CTX_CHECKPOINTS * 64 )) MiB of host RAM (about 64 MiB each) on top of --cache-ram $CACHE_RAM MiB. On a 16 GB host that also holds CPU-resident experts, this risks paging."
 fi
-[[ "$THINKING" == "0" || "$THINKING" == "1" ]] || fail "LLM_THINKING must be 0 or 1."
-if [[ "$THINKING" == "1" ]]; then REASONING_MODE=on; THINK_KW=true; else REASONING_MODE=off; THINK_KW=false; fi
+
+# Float validation for sampling parameters. Catches fat-finger errors like
+# LLM_TEMP=abc or LLM_TOP_P=-0.5 before the server sees them.
+for name_fp in TEMP TOP_P MIN_P; do
+  value="${!name_fp}"
+  [[ "$value" =~ ^[0-9]+(\.[0-9]+)?$ ]] \
+    || fail "$name_fp must be a non-negative number (e.g. 0.6, 1, 0.0) (got '$value')."
+done
+
+# If COMPACTION_AT >= CTX the deferred-compaction threshold is never reached:
+# the plugin computes 0.75 * CTX internally, but this informational value
+# should stay below the window so the summary is not misleading.
+(( COMPACTION_AT < CTX )) \
+  || warn "COMPACTION_AT ($COMPACTION_AT) >= CTX ($CTX); the deferred-compaction threshold will never be reached. Set LLM_COMPACTION_AT below $CTX."
+
 [[ "$FIT" == "on" || "$FIT" == "off" ]] || fail "LLM_FIT must be 'on' or 'off' (got '$FIT')."
 if [[ "$FIT" == "on" ]] && (( NCMOE > 0 )); then
   warn "LLM_FIT=on with LLM_NCMOE=$NCMOE: llama.cpp aborts auto-fit when --n-cpu-moe already sets tensor overrides, so fit would do nothing. Use LLM_FIT=off (default) or set LLM_NCMOE=0 to let fit place the experts."
@@ -181,11 +223,15 @@ require_option() {
   has_option "$opt" || fail "This llama-server does not advertise '$opt'. Version: ${SERVER_VERSION:-unknown}. Update llama.cpp."
 }
 
+# --no-context-shift is required, not optional. The deferred-compaction plugin
+# relies on the server refusing requests when the context is full rather than
+# silently truncating old tokens. If the server shifts context instead, the
+# agent's history is corrupted without any error being surfaced to the client.
 REQUIRED_OPTIONS=(
   --model --alias --n-gpu-layers --n-cpu-moe --fit --fit-target --ctx-size
   --parallel --flash-attn --cache-type-k --cache-type-v --batch-size --ubatch-size
-  --jinja --reasoning --temp --top-p --top-k --min-p --threads --threads-batch
-  --host --port
+  --jinja --reasoning --no-context-shift --temp --top-p --top-k --min-p
+  --threads --threads-batch --host --port
 )
 for opt in "${REQUIRED_OPTIONS[@]}"; do require_option "$opt"; done
 
@@ -248,13 +294,6 @@ if [[ -n "$CHECKPOINT_EVERY" ]]; then
   fi
 fi
 
-# Explicitly avoid silent context shifting; the client should compact before the limit.
-if has_option --no-context-shift; then
-  EXTRA+=(--no-context-shift)
-else
-  warn "--no-context-shift is unavailable; verify the server's default context-shift behavior."
-fi
-
 # Optional MTP: the GGUF contains an MTP layer, but leave it off by default to
 # preserve VRAM for the 128K context. Enable only after the base model is stable.
 if [[ "$USE_MTP" == "1" ]]; then
@@ -297,11 +336,12 @@ echo "If startup fails with CUDA OOM: LLM_UBATCH=256, or LLM_NCMOE=$((NCMOE+1)),
 echo "Threads:     decode=$THREADS (physical=$PHYS) | batch=$THREADS_BATCH (logical=$LOGICAL)"
 echo "Sampling:    temp=$TEMP top_p=$TOP_P top_k=$TOP_K min_p=$MIN_P"
 if [[ "$THINKING" == "1" ]]; then
-  echo "Thinking:    ENABLED (--reasoning on + enable_thinking=true); reasoning tokens count toward the context"
+  echo "Thinking:    ENABLED (--reasoning on); reasoning tokens count toward the context"
 else
-  echo "Thinking:    disabled (--reasoning off + enable_thinking=false where supported)"
+  echo "Thinking:    disabled (--reasoning off)"
 fi
-echo "Compaction:  configure in the agent client at ~$COMPACTION_AT tokens; server does not summarize history"
+echo "Ctx-shift:   disabled (--no-context-shift); client must compact before the context limit"
+echo "Compaction:  client threshold ~$COMPACTION_AT tokens (75% of $CTX); server does not summarize history"
 echo "MTP:         $USE_MTP"
 echo "Vision:      ${MMPROJ:-disabled}"
 echo "Server:      http://$HOST:$PORT"
@@ -327,6 +367,7 @@ SERVER_ARGS=(
   --ubatch-size "$UBATCH"
   --jinja
   --reasoning "$REASONING_MODE"
+  --no-context-shift
   --temp "$TEMP"
   --top-p "$TOP_P"
   --top-k "$TOP_K"
